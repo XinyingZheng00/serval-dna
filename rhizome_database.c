@@ -27,6 +27,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "serval.h"
 #include "conf.h"
 #include "rhizome.h"
+#include "rhizome_ozonedb_bridge.h" // not upstream -- OzoneDB backend experiment
 #include "strbuf.h"
 #include "strbuf_helpers.h"
 #include "str.h"
@@ -1499,84 +1500,103 @@ enum rhizome_bundle_status rhizome_add_manifest_to_store(rhizome_manifest *m, rh
   rhizome_manifest_to_bar(m, &bar);
 
   sqlite_retry_state retry = SQLITE_RETRY_STATE_DEFAULT;
-  if (sqlite_exec_void_retry(&retry, "BEGIN TRANSACTION;", END) == -1)
-    return WHY("Failed to begin transaction");
-
+  sqlite3_stmt *stmt = NULL;
   time_ms_t now = gettime_ms();
 
-  // The INSERT OR REPLACE statement will delete a row with the same ID (primary key) if it exists,
-  // so a new autoincremented ROWID will be allocated whether or not the manifest with this ID is
-  // already in the table.  Other code depends on this property: that ROWID is monotonically
-  // increasing with time and unique.
-  sqlite3_stmt *stmt;
-  if ((stmt = sqlite_prepare_bind(&retry,
-	"INSERT OR REPLACE INTO MANIFESTS("
-	  "id,"
-	  "manifest,"
-	  "version,"
-	  "inserttime,"
-	  "bar,"
-	  "filesize,"
-	  "filehash,"
-	  "author,"
-	  "service,"
-	  "name,"
-	  "sender,"
-	  "recipient,"
-	  "tail,"
-	  "manifest_hash"
-	") VALUES("
-	  "?,?,?,?,?,?,?,?,?,?,?,?,?,?"
-	");",
-	RHIZOME_BID_T, &m->keypair.public_key,
-	STATIC_BLOB, m->manifestdata, m->manifest_all_bytes,
-	INT64, m->version,
-	INT64, (int64_t) now,
-	RHIZOME_BAR_T, &bar,
-	INT64, m->filesize,
-	RHIZOME_FILEHASH_T|NUL, m->filesize > 0 ? &m->filehash : NULL,
-	// Only store the author if it is known to be authentic.
-	SID_T|NUL, m->authorship == AUTHOR_AUTHENTIC ? &m->author : NULL,
-	STATIC_TEXT, m->service,
-	STATIC_TEXT|NUL, m->name,
-	SID_T|NUL, m->has_sender ? &m->sender : NULL,
-	SID_T|NUL, m->has_recipient ? &m->recipient : NULL,
-	INT64, m->tail,
-	RHIZOME_FILEHASH_T, &m->manifesthash,
-	END
-      )
-  ) == NULL)
-    goto rollback;
-  if (!sqlite_code_ok(sqlite_step_retry(&retry, stmt)))
-    goto rollback;
-  sqlite3_finalize(stmt);
-  stmt = NULL;
-  rhizome_manifest_set_rowid(m, sqlite3_last_insert_rowid(rhizome_database.db));
-  rhizome_manifest_set_inserttime(m, now);
-
-  if (sqlite_exec_void_retry(&retry, "COMMIT;", END) != -1){
-    // This message used in tests; do not modify or remove.
-    INFOF("RHIZOME ADD MANIFEST service=%s bid=%s version=%"PRIu64,
-	  m->service ? m->service : "NULL",
-	  alloca_tohex_rhizome_bid_t(m->keypair.public_key),
-	  m->version
-	);
-    if (serverMode != SERVER_NOT_RUNNING) {
-      assert(max_rowid < m->rowid);
-      // detect any bundles added by the CLI
-      // due to potential race conditions, we have to do this here
-      // even though the CLI will try to send us a MDP_SYNC_RHIZOME message
-      if (m->rowid > max_rowid+1)
-	rhizome_process_added_bundles(m->rowid);
-      max_rowid = m->rowid;
-      CALL_TRIGGER(bundle_add, m);
-    }else{
-      sync_rhizome();
+  if (rhizome_ozonedb_enabled()) {
+    // Not upstream: OzoneDB backend experiment. See
+    // rhizome_ozonedb_bridge.c -- next_rowid() guarantees the
+    // max_rowid < m->rowid assert below still holds; the cross-process
+    // "detect bundles added by CLI via a gap in the shared rowid sequence"
+    // mechanism a few lines down does not fire under this bridge (each
+    // process has its own rowid counter, not a shared one backed by a
+    // single physical file) -- documented simplification, does not affect
+    // add/extract correctness, which is verified independently per bundle.
+    if (ozonedb_add_manifest(m, now) != RHIZOME_BUNDLE_STATUS_NEW) {
+      WHYF("Failed to store bundle bid=%s (ozonedb)", alloca_tohex_rhizome_bid_t(m->keypair.public_key));
+      return RHIZOME_BUNDLE_STATUS_ERROR;
     }
-    if (mout)
-      *mout = m;
-    return RHIZOME_BUNDLE_STATUS_NEW;
+  } else {
+    if (sqlite_exec_void_retry(&retry, "BEGIN TRANSACTION;", END) == -1)
+      return WHY("Failed to begin transaction");
+
+    // The INSERT OR REPLACE statement will delete a row with the same ID (primary key) if it exists,
+    // so a new autoincremented ROWID will be allocated whether or not the manifest with this ID is
+    // already in the table.  Other code depends on this property: that ROWID is monotonically
+    // increasing with time and unique.
+    if ((stmt = sqlite_prepare_bind(&retry,
+	  "INSERT OR REPLACE INTO MANIFESTS("
+	    "id,"
+	    "manifest,"
+	    "version,"
+	    "inserttime,"
+	    "bar,"
+	    "filesize,"
+	    "filehash,"
+	    "author,"
+	    "service,"
+	    "name,"
+	    "sender,"
+	    "recipient,"
+	    "tail,"
+	    "manifest_hash"
+	  ") VALUES("
+	    "?,?,?,?,?,?,?,?,?,?,?,?,?,?"
+	  ");",
+	  RHIZOME_BID_T, &m->keypair.public_key,
+	  STATIC_BLOB, m->manifestdata, m->manifest_all_bytes,
+	  INT64, m->version,
+	  INT64, (int64_t) now,
+	  RHIZOME_BAR_T, &bar,
+	  INT64, m->filesize,
+	  RHIZOME_FILEHASH_T|NUL, m->filesize > 0 ? &m->filehash : NULL,
+	  // Only store the author if it is known to be authentic.
+	  SID_T|NUL, m->authorship == AUTHOR_AUTHENTIC ? &m->author : NULL,
+	  STATIC_TEXT, m->service,
+	  STATIC_TEXT|NUL, m->name,
+	  SID_T|NUL, m->has_sender ? &m->sender : NULL,
+	  SID_T|NUL, m->has_recipient ? &m->recipient : NULL,
+	  INT64, m->tail,
+	  RHIZOME_FILEHASH_T, &m->manifesthash,
+	  END
+	)
+    ) == NULL)
+      goto rollback;
+    if (!sqlite_code_ok(sqlite_step_retry(&retry, stmt)))
+      goto rollback;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    rhizome_manifest_set_rowid(m, sqlite3_last_insert_rowid(rhizome_database.db));
+    rhizome_manifest_set_inserttime(m, now);
+
+    if (sqlite_exec_void_retry(&retry, "COMMIT;", END) == -1) {
+      WHYF("Failed to store bundle bid=%s", alloca_tohex_rhizome_bid_t(m->keypair.public_key));
+      sqlite_exec_void_retry(&retry, "ROLLBACK;", END);
+      return RHIZOME_BUNDLE_STATUS_ERROR;
+    }
   }
+
+  // This message used in tests; do not modify or remove.
+  INFOF("RHIZOME ADD MANIFEST service=%s bid=%s version=%"PRIu64,
+	m->service ? m->service : "NULL",
+	alloca_tohex_rhizome_bid_t(m->keypair.public_key),
+	m->version
+      );
+  if (serverMode != SERVER_NOT_RUNNING) {
+    assert(max_rowid < m->rowid);
+    // detect any bundles added by the CLI
+    // due to potential race conditions, we have to do this here
+    // even though the CLI will try to send us a MDP_SYNC_RHIZOME message
+    if (m->rowid > max_rowid+1)
+      rhizome_process_added_bundles(m->rowid);
+    max_rowid = m->rowid;
+    CALL_TRIGGER(bundle_add, m);
+  }else{
+    sync_rhizome();
+  }
+  if (mout)
+    *mout = m;
+  return RHIZOME_BUNDLE_STATUS_NEW;
 
 rollback:
   if (stmt)
@@ -1785,6 +1805,15 @@ void rhizome_bytes_to_hex_upper(unsigned const char *in, char *out, int byteCoun
  */
 enum rhizome_bundle_status rhizome_find_duplicate(const rhizome_manifest *m, rhizome_manifest **found)
 {
+  // Not upstream: stubbed for the OzoneDB backend experiment. Real
+  // duplicate detection needs a filtered scan (WHERE filesize=? AND
+  // service=? ...) which OzoneDB's put/get/remove API can't express --
+  // out of scope for this benchmark.
+  // Always reports "no duplicate found", same as an empty store would.
+  if (rhizome_ozonedb_enabled()) {
+    if (found) *found = NULL;
+    return RHIZOME_BUNDLE_STATUS_NEW;
+  }
   if (m->service == NULL)
     return WHY("Manifest has no service");
   char sqlcmd[1024];
@@ -1927,6 +1956,8 @@ static enum rhizome_bundle_status step_unpack_manifest_row(sqlite_retry_state *r
 enum rhizome_bundle_status rhizome_retrieve_manifest(const rhizome_bid_t *bidp, rhizome_manifest *m)
 {
   DEBUGF(rhizome, "retrieve manifest bid=%s", bidp ? alloca_tohex_rhizome_bid_t(*bidp) : "<NULL>");
+  if (rhizome_ozonedb_enabled())
+    return ozonedb_retrieve_manifest(bidp, m);
   sqlite_retry_state retry = SQLITE_RETRY_STATE_DEFAULT;
   sqlite3_stmt *statement = sqlite_prepare_bind(&retry,
       "SELECT id, manifest, version, inserttime, author, rowid FROM manifests WHERE id = ?",

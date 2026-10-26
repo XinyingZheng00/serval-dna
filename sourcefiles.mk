@@ -104,6 +104,7 @@ SERVAL_DAEMON_SOURCES = \
 	rhizome_bundle.c \
 	rhizome_crypto.c \
 	rhizome_database.c \
+	rhizome_ozonedb_bridge.c \
 	overlay_mdp_rhizome.c \
 	rhizome_direct.c \
 	rhizome_direct_cli.c \

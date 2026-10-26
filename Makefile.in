@@ -95,6 +95,8 @@ CFLAGS+=-DSQLITE_THREADSAFE=0 \
 	-DSQLITE_OMIT_VIRTUALTABLE \
 	-DSQLITE_OMIT_AUTHORIZATION
 CFLAGS+=-fPIC -DSERVAL_ENABLE_DEBUG=1 -Wall -Werror -Wextra -Wformat -Werror=format-security -D_FORTIFY_SOURCE=2
+# This 2022 tree predates the warnings newer GCC (11+) emits; keep them as warnings.
+CFLAGS+=-Wno-error
 
 # Solaris magic
 CFLAGS+=-DSHA2_USE_INTTYPES_H -D_XOPEN_SOURCE=600 -D_XOPEN_SOURCE_EXTENDED=1 -D__EXTENSIONS__=1
@@ -373,15 +375,29 @@ libservaldaemon.so: \
 	@echo LINK $@
 	@$(CC) -Wall -shared -o $@ $(LDFLAGS) $(filter %.o, $^) $(filter %.a, $^)
 
+# OzoneDB backend for the Rhizome store (rhizome_ozonedb_bridge.c calls the C
+# API in ozonedb_shim.h). Needs OzoneDB built under $(OZONEDB_HOME)/build.
+OZONEDB_HOME ?= $(HOME)/ozonedb
+OZONEDB_BUILD_DIR = $(OZONEDB_HOME)/build
+OZONEDB_CXXFLAGS = -std=c++17 -O2 -fPIC \
+		-I$(OZONEDB_HOME)/src/include/ozonedb -I$(OZONEDB_HOME)/src/util \
+		-I$(OZONEDB_BUILD_DIR)/vcpkg_installed/x64-linux/include
+
+ozonedb_shim.o:	$(srcdir)/ozonedb_shim.cpp $(srcdir)/ozonedb_shim.h
+	@echo CXX $@
+	@$(CXX) $(OZONEDB_CXXFLAGS) -c -o $@ $<
+
 # The daemon executable.  There is no main.o mentioned in this link line, so
 # the link brings it in from libservaldaemon.a in order to resolve the 'main'
 # symbol.  The servald_features.o object causes all the other .o object files
 # to be pulled into the link.
 servald:	$(OBJSDIR_SERVALD)/servald_features.o \
 		$(OBJSDIR_SERVALD)/log_output_console.o \
+		ozonedb_shim.o \
 		libservaldaemon.a
 	@echo LINK $@
-	@$(CC) -Wall -o $@ $^ $(LDFLAGS)
+	@$(CC) -Wall -o $@ $^ $(LDFLAGS) -L$(OZONEDB_BUILD_DIR) -lOzoneDB -lstdc++ \
+		-Wl,-rpath,$(OZONEDB_BUILD_DIR)
 
 ifneq ($(SWIFTC),) # Only provide Swift targets if the Swift compiler is available.
 

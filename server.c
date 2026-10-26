@@ -33,6 +33,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/param.h>
 #ifdef HAVE_LINUX_THREADS
 #include <sys/syscall.h>
 #endif
@@ -624,11 +625,108 @@ void rhizome_clean_db(struct sched_ent *alarm)
 {
   if (!config.rhizome.enable || !rhizome_database.db)
     return;
-    
+
   time_ms_t now = gettime_ms();
   rhizome_cleanup(NULL);
   // clean up every 30 minutes or so
   RESCHEDULE(alarm, now + 30*60*1000, TIME_MS_NEVER_WILL, TIME_MS_NEVER_WILL);
+}
+
+// BENCHMARK-ONLY, opt-in via RHIZOME_PERSISTENT_ADD_INTERVAL_MS (unset by
+// default -- every normal servald invocation, including the sqlite_rest
+// REST benchmark backend, is unaffected). Reproduces, inside the REAL
+// daemon process and through its own already-open rhizome_database.db
+// handle (opened once above in server_on_config_change(), same as any
+// other daemon usage), a persistent single-connection writer -- to compare
+// against N independently-opened short-lived CLI writers on the same
+// store, per serval-dna issue #1. Body reuses the same core functions
+// app_rhizome_add_file() (rhizome_cli.c) calls for a real `rhizome add
+// file`, just without that function's per-invocation instance-dir/keyring/
+// db-open setup, since this alarm runs inside a process that already did
+// all of that once at startup.
+DEFINE_ALARM(persistent_adder_tick);
+void persistent_adder_tick(struct sched_ent *alarm)
+{
+  if (!config.rhizome.enable || !rhizome_database.db)
+    return;
+  const char *interval_str = getenv("RHIZOME_PERSISTENT_ADD_INTERVAL_MS");
+  if (!interval_str || !*interval_str)
+    return;
+  int interval_ms = atoi(interval_str);
+  if (interval_ms <= 0)
+    return;
+  time_ms_t now = gettime_ms();
+
+  char path[MAXPATHLEN];
+  if (!FORMF_SERVAL_TMP_PATH(path, "persistent_adder.XXXXXX")) {
+    WHY("persistent_adder_tick: FORMF_SERVAL_TMP_PATH failed");
+    RESCHEDULE(alarm, now + interval_ms, now + interval_ms, TIME_MS_NEVER_WILL);
+    return;
+  }
+  int fd = mkstemp(path);
+  if (fd == -1) {
+    WHYF_perror("persistent_adder_tick: mkstemp(%s)", path);
+    RESCHEDULE(alarm, now + interval_ms, now + interval_ms, TIME_MS_NEVER_WILL);
+    return;
+  }
+  char payload[128];
+  int n = snprintf(payload, sizeof payload, "persistent_adder tick=%"PRItime_ms_t" rand=%d\n",
+                    now, (int)random());
+  ssize_t wrote = write(fd, payload, (size_t)n);
+  close(fd);
+  if (wrote != n) {
+    WHY("persistent_adder_tick: short write to tmp payload file");
+    unlink(path);
+    RESCHEDULE(alarm, now + interval_ms, now + interval_ms, TIME_MS_NEVER_WILL);
+    return;
+  }
+
+  rhizome_manifest *m = rhizome_new_manifest();
+  int ok = 0;
+  if (m) {
+    rhizome_manifest *mout = NULL;
+    struct rhizome_bundle_result result = rhizome_manifest_add_file(
+        0, m, &mout, NULL, NULL, NULL, path, 0, NULL);
+    if (result.status == RHIZOME_BUNDLE_STATUS_NEW) {
+      if (mout != m) {
+        rhizome_manifest_free(m);
+        m = mout;
+      }
+      enum rhizome_payload_status pstatus = rhizome_stat_payload_file(m, path);
+      if (pstatus == RHIZOME_PAYLOAD_STATUS_NEW)
+        pstatus = rhizome_store_payload_file(m, path);
+      if (pstatus == RHIZOME_PAYLOAD_STATUS_NEW || pstatus == RHIZOME_PAYLOAD_STATUS_STORED
+          || pstatus == RHIZOME_PAYLOAD_STATUS_EMPTY) {
+        rhizome_bundle_result_free(&result);
+        if (!rhizome_manifest_validate(m) || m->malformed) {
+          WHY("persistent_adder_tick: manifest failed validation");
+        } else {
+          rhizome_manifest *fout = NULL;
+          result = rhizome_manifest_finalise(m, &fout, 1);
+          if (result.status == RHIZOME_BUNDLE_STATUS_NEW
+              || result.status == RHIZOME_BUNDLE_STATUS_SAME
+              || result.status == RHIZOME_BUNDLE_STATUS_DUPLICATE) {
+            ok = 1;
+          }
+          if (fout && fout != m)
+            rhizome_manifest_free(fout);
+        }
+      } else {
+        WHYF("persistent_adder_tick: payload store failed, pstatus=%d", pstatus);
+      }
+    }
+    rhizome_bundle_result_free(&result);
+    rhizome_manifest_free(m);
+  }
+  unlink(path);
+  time_ms_t duration_ms = gettime_ms() - now;
+  if (ok)
+    INFOF("persistent_adder_tick: added bundle at %"PRItime_ms_t" duration_ms=%"PRItime_ms_t,
+          now, duration_ms);
+  else
+    WHYF("persistent_adder_tick: add failed duration_ms=%"PRItime_ms_t, duration_ms);
+
+  RESCHEDULE(alarm, now + interval_ms, now + interval_ms, TIME_MS_NEVER_WILL);
 }
 
 static void server_on_config_change()
@@ -655,6 +753,14 @@ static void server_on_config_change()
   if (config.rhizome.enable){
     rhizome_opendb();
     RESCHEDULE(&ALARM_STRUCT(rhizome_clean_db), now + 30*60*1000, TIME_MS_NEVER_WILL, TIME_MS_NEVER_WILL);
+    // BENCHMARK-ONLY: see persistent_adder_tick() above. No-op unless
+    // RHIZOME_PERSISTENT_ADD_INTERVAL_MS is set in the daemon's environment.
+    const char *adder_interval_str = getenv("RHIZOME_PERSISTENT_ADD_INTERVAL_MS");
+    if (adder_interval_str && *adder_interval_str && atoi(adder_interval_str) > 0) {
+      int adder_interval_ms = atoi(adder_interval_str);
+      RESCHEDULE(&ALARM_STRUCT(persistent_adder_tick), now + adder_interval_ms,
+                 now + adder_interval_ms, TIME_MS_NEVER_WILL);
+    }
   }else if(rhizome_database.db){
     rhizome_close_db();
   }

@@ -717,6 +717,13 @@ struct rhizome_write
 
   unsigned char key[RHIZOME_CRYPT_KEY_BYTES];
   unsigned char nonce[crypto_box_NONCEBYTES];
+
+  // OzoneDB backend experiment (not upstream): flat in-memory payload
+  // buffer, filled by ozonedb_write_data() and flushed by
+  // ozonedb_write_finish() in place of the sql_blob incremental-write path.
+  unsigned char *oz_buf;
+  size_t oz_buf_len;
+  size_t oz_buf_cap;
 };
 
 struct rhizome_read_buffer{
@@ -742,6 +749,12 @@ struct rhizome_read
   rhizome_filehash_t id;
   unsigned char key[RHIZOME_CRYPT_KEY_BYTES];
   unsigned char nonce[crypto_box_NONCEBYTES];
+
+  // OzoneDB backend experiment (not upstream): whole payload fetched into
+  // this buffer by ozonedb_read_open(), served by ozonedb_read_data() in
+  // place of the sql_blob incremental-read path.
+  unsigned char *oz_buf;
+  size_t oz_buf_len;
 };
 
 int rhizome_received_content(const unsigned char *bidprefix,uint64_t version, 

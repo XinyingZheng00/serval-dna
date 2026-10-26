@@ -37,6 +37,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "str.h"
 #include "numeric_str.h"
 #include "debug.h"
+#include "rhizome_ozonedb_bridge.h" // not upstream -- OzoneDB backend experiment
 
 #define RHIZOME_BUFFER_MAXIMUM_SIZE (1024*1024)
 
@@ -46,6 +47,8 @@ uint64_t rhizome_copy_file_to_blob(int fd, uint64_t id, size_t size);
 
 enum rhizome_payload_status rhizome_exists(const rhizome_filehash_t *hashp)
 {
+  if (rhizome_ozonedb_enabled())
+    return ozonedb_check_exists(hashp);
   sqlite_retry_state retry = SQLITE_RETRY_STATE_DEFAULT;
   uint64_t gotfile = 0;
   int stepcode = sqlite_exec_uint64_retry(&retry, &gotfile, "SELECT COUNT(*) FROM FILES WHERE id = ? and datavalid = 1;",
@@ -359,7 +362,10 @@ enum rhizome_payload_status rhizome_open_write(struct rhizome_write *write, cons
 
   write->blob_fd=-1;
   write->sql_blob=NULL;
-  
+  write->oz_buf=NULL;
+  write->oz_buf_len=0;
+  write->oz_buf_cap=0;
+
   if (expectedHashp){
     if (rhizome_exists(expectedHashp) == RHIZOME_PAYLOAD_STATUS_STORED)
       return RHIZOME_PAYLOAD_STATUS_STORED;
@@ -368,8 +374,12 @@ enum rhizome_payload_status rhizome_open_write(struct rhizome_write *write, cons
   }else{
     write->id_known=0;
   }
-  
-  if (file_length!=RHIZOME_SIZE_UNSET){
+
+  // store_make_space() is SQLite eviction/space-accounting logic with no
+  // OzoneDB equivalent (not upstream note: out of scope for this
+  // experiment -- our test payloads are small and well under any
+  // reasonable store size limit).
+  if (file_length!=RHIZOME_SIZE_UNSET && !rhizome_ozonedb_enabled()){
     enum rhizome_payload_status status = store_make_space(file_length, NULL);
     if (status != RHIZOME_PAYLOAD_STATUS_NEW)
       return status;
@@ -420,12 +430,15 @@ static int prepare_data(struct rhizome_write *write_state, uint8_t *buffer, size
 // open database locks
 static int write_get_lock(struct rhizome_write *write_state)
 {
+  if (rhizome_ozonedb_enabled())
+    return ozonedb_write_get_lock(write_state);
+
   sqlite_retry_state retry = SQLITE_RETRY_STATE_DEFAULT;
-  
+
   if (write_state->blob_fd != -1 || write_state->sql_blob)
     return 0;
-  
-  if (write_state->file_length == RHIZOME_SIZE_UNSET || 
+
+  if (write_state->file_length == RHIZOME_SIZE_UNSET ||
     write_state->file_length > config.rhizome.max_blob_size){
     char blob_path[1024];
     if (!FORMF_RHIZOME_STORE_PATH(blob_path, "%s/%"PRIu64, RHIZOME_BLOB_SUBDIR, write_state->temp_id))
@@ -464,10 +477,17 @@ static int write_data(struct rhizome_write *write_state, uint64_t file_offset, u
 
   if (data_size<=0)
     return 0;
-  
+
   if (file_offset != write_state->written_offset)
     WARNF("Writing file data out of order! [%"PRId64",%"PRId64"]", file_offset, write_state->written_offset);
-    
+
+  if (rhizome_ozonedb_enabled()) {
+    if (ozonedb_write_data(write_state, file_offset, buffer, data_size) == -1)
+      return -1;
+    write_state->written_offset = file_offset + data_size;
+    return 0;
+  }
+
   if (write_state->blob_fd != -1) {
     size_t ofs = 0;
     // keep trying until all of the data is written.
@@ -497,6 +517,8 @@ static int write_data(struct rhizome_write *write_state, uint64_t file_offset, u
 // close database locks
 static int write_release_lock(struct rhizome_write *write_state)
 {
+  if (rhizome_ozonedb_enabled())
+    return 0; // flush happens in ozonedb_write_finish(), called from rhizome_finish_write()
   int ret=0;
   if (write_state->sql_blob){
     ret = sqlite_blob_close(write_state->sql_blob);
@@ -760,7 +782,10 @@ enum rhizome_payload_status rhizome_finish_write(struct rhizome_write *write)
     write->file_length = write->file_offset;
     if (write->file_length == 0)
       status = RHIZOME_PAYLOAD_STATUS_EMPTY;
-    else {
+    else if (!rhizome_ozonedb_enabled()) {
+      // store_make_space() is SQLite eviction/space-accounting logic with
+      // no OzoneDB equivalent (not upstream note: out of scope, see
+      // rhizome_open_write()'s matching guard).
       status = store_make_space(write->file_length, NULL);
       if (status != RHIZOME_PAYLOAD_STATUS_NEW)
 	goto failure;
@@ -840,6 +865,23 @@ enum rhizome_payload_status rhizome_finish_write(struct rhizome_write *write)
   if (write_release_lock(write)) {
     status = RHIZOME_PAYLOAD_STATUS_ERROR;
     goto failure;
+  }
+
+  if (rhizome_ozonedb_enabled()) {
+    // Not upstream: OzoneDB backend experiment. Skips the dedup-on-CONSTRAINT
+    // and external-blob-file branches below entirely -- our test payloads
+    // are unique per bundle and small enough to stay off the external-file
+    // path (see rhizome_open_write()'s max_blob_size branch, which never
+    // engages for OzoneDB since ozonedb_write_get_lock() always uses the
+    // in-memory buffer).
+    if (ozonedb_write_finish(write, write->file_length) == -1) {
+      status = RHIZOME_PAYLOAD_STATUS_ERROR;
+      goto failure;
+    }
+    write->blob_rowid = 0;
+    if (status == RHIZOME_PAYLOAD_STATUS_NEW)
+      DEBUGF(rhizome_store, "Stored file %s", alloca_tohex_rhizome_filehash_t(write->id));
+    return status;
   }
 
   sqlite_retry_state retry = SQLITE_RETRY_STATE_DEFAULT;
@@ -1095,6 +1137,11 @@ enum rhizome_payload_status rhizome_open_read(struct rhizome_read *read, const r
   read->verified = 0;
   read->offset = 0;
   read->hash_offset = 0;
+  read->oz_buf = NULL;
+  read->oz_buf_len = 0;
+
+  if (rhizome_ozonedb_enabled())
+    return ozonedb_read_open(read, hashp);
 
   sqlite_retry_state retry = SQLITE_RETRY_STATE_DEFAULT;
 
@@ -1170,6 +1217,8 @@ enum rhizome_payload_status rhizome_open_read(struct rhizome_read *read, const r
 static ssize_t rhizome_read_retry(sqlite_retry_state *retry, struct rhizome_read *read_state, unsigned char *buffer, size_t bufsz)
 {
   IN();
+  if (rhizome_ozonedb_enabled())
+    RETURN(ozonedb_read_data(read_state, buffer, bufsz));
   if (read_state->blob_fd != -1) {
     assert(read_state->offset <= read_state->length);
     if (lseek64(read_state->blob_fd, (off64_t) read_state->offset, SEEK_SET) == -1)
@@ -1345,6 +1394,12 @@ void rhizome_read_close(struct rhizome_read *read)
   if (read->length == 0)
     // bzero'd & never opened, or already closed
     return;
+
+  if (read->oz_buf) {
+    free(read->oz_buf);
+    read->oz_buf = NULL;
+    read->oz_buf_len = 0;
+  }
 
   if (read->blob_fd != -1) {
     DEBUGF(rhizome_store, "Closing store fd %d", read->blob_fd);
